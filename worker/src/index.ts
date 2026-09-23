@@ -1,4 +1,5 @@
 import { ALIASES } from "./aliases";
+import { translateQuery } from "./translations";
 
 export interface Env {
   AH_TOKENS: KVNamespace;
@@ -186,7 +187,7 @@ export default {
         continue;
       }
       try {
-        const found = await searchProduct(accessToken, raw);
+        const found = await searchProduct(accessToken, translateQuery(raw));
         if (found) {
           toAdd.push({ productId: found.productId, quantity: 1, title: found.title, input: raw });
         } else {

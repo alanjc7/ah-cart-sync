@@ -12,4 +12,5 @@ export const ALIASES: Record<string, { productId: number; title: string }> = {
   wraps: { productId: 173410, title: "AH Tortilla naturel wraps large 12 stuks" },
   yoghurt: { productId: 60746, title: "AH Biologisch Volle yoghurt" },
   "peanut butter": { productId: 479791, title: "AH Terra Plantaardig 100% pindakaas naturel" },
+  "sour cream": {productId: 585958, title: "AH Biologisch Sour cream"},
 };

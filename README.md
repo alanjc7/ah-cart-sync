@@ -87,6 +87,11 @@ export const ALIASES: Record<string, { productId: number; title: string }> = {
 Redeploy with `npx wrangler deploy` after editing. Anything not in the map falls back to
 "first AH search result for that name" — fine for unambiguous items, riskier for vague ones.
 
+AH's search is Dutch-language, so an unmapped English word (e.g. "onions") often finds
+nothing useful. `worker/src/translations.ts` has a small built-in English→Dutch word list
+used only for the search fallback — extend it for words you use often, but for anything
+important, adding it to `aliases.ts` instead is more reliable.
+
 ## 4. Build the iOS Shortcut
 
 Use a shared **Reminders** list instead of a Note — Shortcuts gives structured access to
