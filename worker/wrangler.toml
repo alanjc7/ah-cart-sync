@@ -1,0 +1,7 @@
+name = "ah-cart-sync"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+kv_namespaces = [
+  { binding = "AH_TOKENS", id = "aa64b46973d14ef6ace743815b2637d0" }
+]
