@@ -13,4 +13,7 @@ export const ALIASES: Record<string, { productId: number; title: string }> = {
   yoghurt: { productId: 60746, title: "AH Biologisch Volle yoghurt" },
   "peanut butter": { productId: 479791, title: "AH Terra Plantaardig 100% pindakaas naturel" },
   "sour cream": {productId: 585958, title: "AH Biologisch Sour cream"},
+  "shoarma": {productId: 563706, title: "AH Terra Plantaardige shoarma"},
+  "tofu": {productId: 598995, title: "AH Terra Biologische tofu grootverpakking"},
+  "pastry": {productId: 503093, title: "AH Vers bladerdeeg"},
 };
