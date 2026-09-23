@@ -1,9 +1,11 @@
 import { ALIASES } from "./aliases";
-import { translateQuery } from "./translations";
+import { PREFERENCES } from "./preferences";
+import { translateToSearchTerm, pickBestMatch, type Candidate } from "./llm";
 
 export interface Env {
   AH_TOKENS: KVNamespace;
   SYNC_SECRET: string;
+  ANTHROPIC_API_KEY: string;
 }
 
 const AH_API_BASE = "https://api.ah.nl";
@@ -72,11 +74,8 @@ async function getAccessToken(env: Env): Promise<string> {
   return refreshed.access_token;
 }
 
-async function searchProduct(
-  accessToken: string,
-  query: string
-): Promise<{ productId: number; title: string } | null> {
-  const params = new URLSearchParams({ query, page: "0", size: "5", sortOn: "RELEVANCE" });
+async function searchProducts(accessToken: string, query: string): Promise<Candidate[]> {
+  const params = new URLSearchParams({ query, page: "0", size: "8", sortOn: "RELEVANCE" });
   const resp = await fetch(`${AH_API_BASE}/mobile-services/product/search/v2?${params}`, {
     headers: ahHeaders(accessToken),
   });
@@ -84,10 +83,24 @@ async function searchProduct(
     throw new Error(`search failed for "${query}": ${resp.status} ${await resp.text()}`);
   }
   const data = (await resp.json()) as {
-    products: { webshopId: number; title: string }[];
+    products: {
+      webshopId: number;
+      title: string;
+      brand?: string;
+      currentPrice?: number;
+      priceBeforeBonus?: number;
+      isBonus?: boolean;
+      propertyIcons?: string[];
+    }[];
   };
-  const top = data.products?.[0];
-  return top ? { productId: top.webshopId, title: top.title } : null;
+  return (data.products ?? []).map((p) => ({
+    productId: p.webshopId,
+    title: p.title,
+    brand: p.brand ?? "",
+    price: p.currentPrice || p.priceBeforeBonus || 0,
+    isBonus: p.isBonus ?? false,
+    propertyIcons: p.propertyIcons ?? [],
+  }));
 }
 
 async function getActiveOrderId(accessToken: string): Promise<string> {
@@ -100,6 +113,73 @@ async function getActiveOrderId(accessToken: string): Promise<string> {
   }
   const data = (await resp.json()) as { id: number };
   return String(data.id);
+}
+
+async function doGraphQL(
+  accessToken: string,
+  query: string,
+  variables: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const resp = await fetch(`${AH_API_BASE}/graphql`, {
+    method: "POST",
+    headers: ahHeaders(accessToken),
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!resp.ok) {
+    throw new Error(`graphql request failed: ${resp.status} ${await resp.text()}`);
+  }
+  const data = (await resp.json()) as { data?: Record<string, unknown>; errors?: { message: string }[] };
+  if (data.errors?.length) {
+    throw new Error(`graphql error: ${data.errors[0].message}`);
+  }
+  return data.data ?? {};
+}
+
+// Finds the upcoming submitted order that can still be edited (i.e. before
+// its closing time). Used when there's no unsubmitted "active" cart, which
+// is the normal state once you've already placed this week's order.
+async function getModifiableOrderId(accessToken: string): Promise<string> {
+  const query = `query OrderFulfillments {
+    orderFulfillments(status: OPEN) {
+      result { orderId modifiable }
+    }
+  }`;
+  const data = await doGraphQL(accessToken, query, {});
+  const results = (
+    data.orderFulfillments as { result: { orderId: number; modifiable: boolean }[] }
+  )?.result;
+  const modifiable = results?.find((r) => r.modifiable);
+  if (!modifiable) {
+    throw new Error("No modifiable upcoming order found — nothing to amend");
+  }
+  return String(modifiable.orderId);
+}
+
+// Unlocks a submitted order for editing. Mirrors clicking "Amend" in the app.
+// ⚠️ Reverse-engineered from appie-go; not confirmed working by its author.
+async function reopenOrder(accessToken: string, orderId: string): Promise<void> {
+  const mutation = `mutation OrderReopen($id: Int!) {
+    orderReopen(id: $id) { status errorMessage }
+  }`;
+  const data = await doGraphQL(accessToken, mutation, { id: Number(orderId) });
+  const result = data.orderReopen as { status: string; errorMessage?: string };
+  if (result?.status !== "SUCCESS") {
+    throw new Error(`reopen order failed: ${result?.errorMessage ?? "unknown error"}`);
+  }
+}
+
+// Re-submits a reopened order. Must always be called after reopenOrder,
+// even if adding items failed, so the order is never left dangling open.
+// ⚠️ Reverse-engineered from appie-go; not confirmed working by its author.
+async function revertOrder(accessToken: string, orderId: string): Promise<void> {
+  const mutation = `mutation OrderRevert($id: Int!) {
+    orderRevert(id: $id) { status errorMessage }
+  }`;
+  const data = await doGraphQL(accessToken, mutation, { id: Number(orderId) });
+  const result = data.orderRevert as { status: string; errorMessage?: string };
+  if (result?.status !== "SUCCESS") {
+    throw new Error(`revert order failed: ${result?.errorMessage ?? "unknown error"}`);
+  }
 }
 
 async function addToCart(
@@ -187,7 +267,9 @@ export default {
         continue;
       }
       try {
-        const found = await searchProduct(accessToken, translateQuery(raw));
+        const searchTerm = await translateToSearchTerm(env.ANTHROPIC_API_KEY, raw);
+        const candidates = await searchProducts(accessToken, searchTerm);
+        const found = await pickBestMatch(env.ANTHROPIC_API_KEY, raw, PREFERENCES, candidates);
         if (found) {
           toAdd.push({ productId: found.productId, quantity: 1, title: found.title, input: raw });
         } else {
@@ -198,16 +280,41 @@ export default {
       }
     }
 
+    let warning: string | undefined;
+
     if (toAdd.length > 0) {
+      let orderId: string;
+      let reopenedOrderId: string | null = null;
       try {
-        const orderId = await getActiveOrderId(accessToken);
-        await addToCart(
-          accessToken,
-          orderId,
-          toAdd.map((i) => ({ productId: i.productId, quantity: i.quantity }))
-        );
-        for (const item of toAdd) {
-          results.push({ input: item.input, status: "added", title: item.title });
+        try {
+          orderId = await getActiveOrderId(accessToken);
+        } catch {
+          // No unsubmitted cart — this week's order is already placed, so
+          // reopen it for editing (same as tapping "Amend" in the app).
+          orderId = await getModifiableOrderId(accessToken);
+          await reopenOrder(accessToken, orderId);
+          reopenedOrderId = orderId;
+        }
+
+        try {
+          await addToCart(
+            accessToken,
+            orderId,
+            toAdd.map((i) => ({ productId: i.productId, quantity: i.quantity }))
+          );
+          for (const item of toAdd) {
+            results.push({ input: item.input, status: "added", title: item.title });
+          }
+        } finally {
+          if (reopenedOrderId) {
+            try {
+              await revertOrder(accessToken, reopenedOrderId);
+            } catch (revertErr) {
+              warning =
+                `Order ${reopenedOrderId} was reopened for editing but could not be ` +
+                `resubmitted — check the AH app manually. (${String(revertErr)})`;
+            }
+          }
         }
       } catch (err) {
         for (const item of toAdd) {
@@ -216,6 +323,6 @@ export default {
       }
     }
 
-    return Response.json({ results });
+    return Response.json({ results, ...(warning ? { warning } : {}) });
   },
 };

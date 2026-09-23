@@ -16,4 +16,5 @@ export const ALIASES: Record<string, { productId: number; title: string }> = {
   "shoarma": {productId: 563706, title: "AH Terra Plantaardige shoarma"},
   "tofu": {productId: 598995, title: "AH Terra Biologische tofu grootverpakking"},
   "pastry": {productId: 503093, title: "AH Vers bladerdeeg"},
+  "garlic": {productId: 185774, title: "AH Biologisch Knoflook"},
 };

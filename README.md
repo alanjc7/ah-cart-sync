@@ -1,15 +1,16 @@
 # ah-cart-sync
 
-Add items from a shared Apple Note to your Albert Heijn cart (next delivery) with one tap
-on your phone.
+Add items from a shared Reminders list to your Albert Heijn cart (next delivery) with one
+tap on your phone.
 
-**How it works:** an iOS Shortcut reads your shared Note, sends the item names to a small
-Cloudflare Worker, which resolves each name to an AH product (via a hand-picked alias map,
-falling back to AH search) and adds it directly to your active order.
+**How it works:** an iOS Shortcut reads your shared Reminders list, sends the item names to
+a small Cloudflare Worker, which resolves each name to an AH product — a hand-picked alias
+map first, falling back to Claude (translating the name and picking the best match against
+your standing preferences) — and adds it directly to your active order.
 
 This talks to Albert Heijn's private mobile-app API directly (reverse-engineered by the
-[appie-go](https://github.com/gwillem/appie-go) project) — no MCP/LLM involved at request
-time, since this is a fixed automation, not a chat tool-use loop.
+[appie-go](https://github.com/gwillem/appie-go) project); the LLM is only used for the
+translate/match step on unmapped items, not for driving the automation itself.
 
 ## 1. One-time AH login (get a refresh token)
 
@@ -63,6 +64,13 @@ Set a secret the Shortcut will send as a bearer token — pick any long random s
 npx wrangler secret put SYNC_SECRET
 ```
 
+Set your Anthropic API key (used to translate item names and pick the best product match
+for anything not in `aliases.ts` — see step 3):
+
+```bash
+npx wrangler secret put ANTHROPIC_API_KEY
+```
+
 Deploy:
 
 ```bash
@@ -84,13 +92,13 @@ export const ALIASES: Record<string, { productId: number; title: string }> = {
 };
 ```
 
-Redeploy with `npx wrangler deploy` after editing. Anything not in the map falls back to
-"first AH search result for that name" — fine for unambiguous items, riskier for vague ones.
-
-AH's search is Dutch-language, so an unmapped English word (e.g. "onions") often finds
-nothing useful. `worker/src/translations.ts` has a small built-in English→Dutch word list
-used only for the search fallback — extend it for words you use often, but for anything
-important, adding it to `aliases.ts` instead is more reliable.
+Redeploy with `npx wrangler deploy` after editing. Anything not in `aliases.ts` is resolved
+by Claude instead: it translates the item name into a Dutch AH search term, then picks the
+best match from the actual search results using the standing preferences in
+`worker/src/preferences.ts` (e.g. "prefer own-brand and organic, unless a premium brand is
+on bonus"). Edit that file in plain English — no schema to follow. This costs a small
+Anthropic API call per unmapped item; anything you have a strong opinion on is still more
+reliable pinned exactly in `aliases.ts`, which skips the LLM (and the cost) entirely.
 
 ## 4. Build the iOS Shortcut
 
@@ -117,4 +125,15 @@ Create a new Shortcut with these actions, in order:
 
 Long-press the Shortcut → **Add to Home Screen** so it's a one-tap icon.
 
+## Amending an already-placed order
 
+If you've already submitted this week's delivery order, there's no unsubmitted cart to add
+to — the Worker detects this and automatically reopens the upcoming order for editing (the
+same as tapping "Amend" in the app), adds the items, then resubmits it.
+
+**This is riskier than the rest of the tool**: the reopen/resubmit calls are reverse-engineered
+from `appie-go` and marked "unconfirmed" by its own author — they're not verified against
+the live API by anyone. If resubmitting fails after a successful reopen, the Worker will not
+silently hide it: the response includes a top-level `"warning"` field telling you to check
+the AH app, and the Shortcut's notification will show it. Check the app after your first few
+syncs that hit this path, to make sure the order looks right before trusting it blindly.
