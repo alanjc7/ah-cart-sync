@@ -108,20 +108,15 @@ free-text note contents.
 
 Create a new Shortcut with these actions, in order:
 
-1. **Get Reminders** from List `<your shared list name>` — set "Include: only if not
-   completed".
-2. **Get Details of Reminders** → *Title*, to turn the reminders into a plain list of
+1. **Find Reminders** where List is `<your shared list name>`
+2. **Get Details of Reminders** → Get *Title* from <Variable prev step> to turn the reminders into a plain list of
    item-name strings.
 3. **Get Contents of URL**:
    - URL: `https://ah-cart-sync.<you>.workers.dev/sync`
    - Method: POST
    - Headers: `Authorization: Bearer <your SYNC_SECRET>`, `Content-Type: application/json`
-   - Request Body (JSON): `{ "items": <the list from step 2> }`
-4. **Show Notification** with the response (e.g. `Get Value for "results"` and show it), so
-   you see what was added / not found.
-5. **Complete Reminders** — pass it the reminders list from step 1, so they're marked done
-   and won't resync next run. (Use **Delete Reminders** instead if you'd rather they
-   disappear entirely.)
+   - Request Body (JSON): `{ "items": <Title (variable prev step)> }`
+4. **Show Notification** optional
 
 Long-press the Shortcut → **Add to Home Screen** so it's a one-tap icon.
 
