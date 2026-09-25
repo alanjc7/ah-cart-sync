@@ -213,6 +213,14 @@ interface SyncResult {
 }
 
 export default {
+  // Keeps the AH session alive: refreshing well before AH invalidates the
+  // token means the refresh token itself never gets a chance to expire.
+  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+    const raw = await env.AH_TOKENS.get(TOKENS_KV_KEY);
+    if (!raw) throw new Error("No AH tokens in KV — run the login bootstrap.");
+    await refreshAccessToken(env, (JSON.parse(raw) as StoredTokens).refresh_token);
+  },
+
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method !== "POST" || url.pathname !== "/sync") {
