@@ -23,7 +23,7 @@ async function callClaude(
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 300,
+      max_tokens: 8000,
       system,
       messages: [{ role: "user", content: userText }],
       tools: [tool],
@@ -43,26 +43,58 @@ async function callClaude(
   return toolUse.input;
 }
 
-// Generates a Dutch AH search term for an item name that may be in English.
-export async function translateToSearchTerm(apiKey: string, itemName: string): Promise<string> {
+export interface NormalizedItem {
+  quantity: number;
+  name: string;
+  searchTerm: string;
+}
+
+// Parses free-form shopping-list lines ("4 x bratwurst", "portobellos big x2")
+// into a quantity, a canonical English name and a Dutch AH search term — all
+// lines in one call. Lines meaning a known alias get that exact key as name.
+export async function normalizeItems(
+  apiKey: string,
+  lines: string[],
+  aliasKeys: string[]
+): Promise<NormalizedItem[]> {
   const out = await callClaude(
     apiKey,
-    `You generate short Dutch search terms for the Albert Heijn (AH) Dutch supermarket app, ` +
-      `given a shopping-list item that may be in English. Reply with the single best Dutch ` +
-      `search term (1-3 words) matching how AH names this product category, using real Dutch ` +
-      `compound words where applicable (e.g. "peanut butter" -> "pindakaas", not "pinda boter").`,
-    itemName,
+    `You parse shopping-list lines written by different people in different formats, for ` +
+      `the Albert Heijn (AH) Dutch supermarket app. For each line, in order, return:\n` +
+      `- quantity: the number of units asked for (e.g. "4 x bratwurst", "portobellos x2"); 1 if none given.\n` +
+      `- name: a short lowercase English name for the item, without the quantity. If the line ` +
+      `means one of these known items, use the known name exactly: ${JSON.stringify(aliasKeys)}\n` +
+      `- searchTerm: the single best Dutch search term (1-3 words) matching how AH names this ` +
+      `product category, using real Dutch compound words (e.g. "peanut butter" -> "pindakaas").`,
+    lines.map((l, i) => `${i}. ${l}`).join("\n"),
     {
-      name: "search_term",
-      description: "The Dutch search term to use on AH's product search.",
+      name: "parsed_items",
+      description: "One entry per input line, in the same order.",
       input_schema: {
         type: "object",
-        properties: { query: { type: "string" } },
-        required: ["query"],
+        properties: {
+          items: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                quantity: { type: "integer" },
+                name: { type: "string" },
+                searchTerm: { type: "string" },
+              },
+              required: ["quantity", "name", "searchTerm"],
+            },
+          },
+        },
+        required: ["items"],
       },
     }
   );
-  return out.query as string;
+  const items = out.items as NormalizedItem[];
+  if (!Array.isArray(items) || items.length !== lines.length) {
+    throw new Error(`Claude parsed ${items?.length} items for ${lines.length} lines`);
+  }
+  return items.map((it) => ({ ...it, quantity: Math.max(1, Math.round(it.quantity) || 1) }));
 }
 
 export interface Candidate {
@@ -74,52 +106,54 @@ export interface Candidate {
   propertyIcons: string[];
 }
 
-// Picks the best candidate for itemName given standing preferences, or null
-// if none plausibly match (caller should treat that as not_found).
-export async function pickBestMatch(
+// Picks the best candidate for each item given standing preferences, in one
+// call. Returns the chosen candidate per item, or null if none plausibly match.
+export async function pickBestMatches(
   apiKey: string,
-  itemName: string,
   preferences: string,
-  candidates: Candidate[]
-): Promise<{ productId: number; title: string } | null> {
-  if (candidates.length === 0) return null;
+  items: { input: string; candidates: Candidate[] }[]
+): Promise<(Candidate | null)[]> {
+  const withCandidates = items.filter((it) => it.candidates.length > 0);
+  if (withCandidates.length === 0) return items.map(() => null);
 
-  const listText = candidates
-    .map((c, i) => {
-      const flags = [c.isBonus ? "BONUS" : null, ...c.propertyIcons].filter(Boolean).join(", ");
-      return `${i}. ${c.title} — brand: ${c.brand || "AH"} — €${c.price.toFixed(2)}${
-        flags ? ` — ${flags}` : ""
-      }`;
+  const listText = withCandidates
+    .map((it, i) => {
+      const options = it.candidates
+        .map((c, j) => {
+          const flags = [c.isBonus ? "BONUS" : null, ...c.propertyIcons].filter(Boolean).join(", ");
+          return `  ${j}. ${c.title} — brand: ${c.brand || "AH"} — €${c.price.toFixed(2)}${
+            flags ? ` — ${flags}` : ""
+          }`;
+        })
+        .join("\n");
+      return `Item ${i}: "${it.input}"\n${options}`;
     })
-    .join("\n");
+    .join("\n\n");
 
   const out = await callClaude(
     apiKey,
-    `You pick the best matching product for a shopping-list item from Albert Heijn (AH) ` +
+    `You pick the best matching product for each shopping-list item from Albert Heijn (AH) ` +
       `Dutch supermarket search results. Standing preferences: ${preferences} ` +
-      `If none of the candidates plausibly match what was actually asked for, set matched to false.`,
-    `Item: "${itemName}"\n\nCandidates:\n${listText}`,
+      `If none of an item's candidates plausibly match what was actually asked for, return null for it.`,
+    listText,
     {
-      name: "pick_product",
-      description: "Choose the best matching candidate index, or none.",
+      name: "pick_products",
+      description: "One entry per item, in order: the chosen candidate index, or null for no match.",
       input_schema: {
         type: "object",
         properties: {
-          matched: { type: "boolean" },
-          index: {
-            type: "integer",
-            description: "Index of the chosen candidate; required if matched is true.",
-          },
-          reason: { type: "string" },
+          picks: { type: "array", items: { type: ["integer", "null"] } },
         },
-        required: ["matched", "reason"],
+        required: ["picks"],
       },
     }
   );
 
-  if (!out.matched || typeof out.index !== "number" || !candidates[out.index]) {
-    return null;
-  }
-  const chosen = candidates[out.index];
-  return { productId: chosen.productId, title: chosen.title };
+  const picks = out.picks as (number | null)[];
+  const chosen = new Map<(typeof items)[number], Candidate | null>();
+  withCandidates.forEach((it, i) => {
+    const idx = picks?.[i];
+    chosen.set(it, typeof idx === "number" ? it.candidates[idx] ?? null : null);
+  });
+  return items.map((it) => chosen.get(it) ?? null);
 }

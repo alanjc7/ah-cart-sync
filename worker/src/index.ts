@@ -1,6 +1,6 @@
 import { ALIASES } from "./aliases";
 import { PREFERENCES } from "./preferences";
-import { translateToSearchTerm, pickBestMatch, type Candidate } from "./llm";
+import { normalizeItems, pickBestMatches, type Candidate } from "./llm";
 
 export interface Env {
   AH_TOKENS: KVNamespace;
@@ -15,6 +15,12 @@ const USER_AGENT = "Appie/9.28 (iPhone17,3; iPhone; CPU OS 26_1 like Mac OS X)";
 const APPLICATION = "AHWEBSHOP";
 const TOKENS_KV_KEY = "tokens";
 const REFRESH_BUFFER_MS = 60_000;
+const LEARNED_ALIASES_KV_KEY = "learned_aliases";
+const RUN_TTL_SECONDS = 24 * 60 * 60;
+// Free-plan Workers allow 50 subrequests per invocation; resolve spends ~6 on
+// token/Claude/order/cart/list calls, the rest on one AH search per item.
+const MAX_SEARCHES = 40;
+const SEARCH_CONCURRENCY = 6;
 
 interface StoredTokens {
   access_token: string;
@@ -103,97 +109,50 @@ async function searchProducts(accessToken: string, query: string): Promise<Candi
   }));
 }
 
-async function getActiveOrderId(accessToken: string): Promise<string> {
+interface ActiveOrder {
+  id: string;
+  quantities: Map<number, number>; // productId -> quantity already in the order
+}
+
+// The open (unsubmitted) order, or null when there isn't one — e.g. no
+// delivery slot booked yet. Items then go to the AH shopping list instead.
+async function getActiveOrder(accessToken: string): Promise<ActiveOrder | null> {
   const resp = await fetch(
     `${AH_API_BASE}/mobile-services/order/v1/summaries/active?sortBy=DEFAULT`,
     { headers: ahHeaders(accessToken) }
   );
   if (!resp.ok) {
-    throw new Error(`get active order failed: ${resp.status} ${await resp.text()}`);
+    console.log(`no active order: ${resp.status} ${await resp.text()}`);
+    return null;
   }
-  const data = (await resp.json()) as { id: number };
-  return String(data.id);
+  const data = (await resp.json()) as {
+    id: number;
+    orderedProducts?: { quantity: number; product: { webshopId: number } }[];
+  };
+  const quantities = new Map<number, number>();
+  for (const p of data.orderedProducts ?? []) {
+    quantities.set(p.product.webshopId, p.quantity);
+  }
+  return { id: String(data.id), quantities };
 }
 
-async function doGraphQL(
-  accessToken: string,
-  query: string,
-  variables: Record<string, unknown>
-): Promise<Record<string, unknown>> {
-  const resp = await fetch(`${AH_API_BASE}/graphql`, {
-    method: "POST",
-    headers: ahHeaders(accessToken),
-    body: JSON.stringify({ query, variables }),
-  });
-  if (!resp.ok) {
-    throw new Error(`graphql request failed: ${resp.status} ${await resp.text()}`);
-  }
-  const data = (await resp.json()) as { data?: Record<string, unknown>; errors?: { message: string }[] };
-  if (data.errors?.length) {
-    throw new Error(`graphql error: ${data.errors[0].message}`);
-  }
-  return data.data ?? {};
+interface ProductToAdd {
+  productId: number;
+  quantity: number;
 }
 
-// Finds the upcoming submitted order that can still be edited (i.e. before
-// its closing time). Used when there's no unsubmitted "active" cart, which
-// is the normal state once you've already placed this week's order.
-async function getModifiableOrderId(accessToken: string): Promise<string> {
-  const query = `query OrderFulfillments {
-    orderFulfillments(status: OPEN) {
-      result { orderId modifiable }
-    }
-  }`;
-  const data = await doGraphQL(accessToken, query, {});
-  const results = (
-    data.orderFulfillments as { result: { orderId: number; modifiable: boolean }[] }
-  )?.result;
-  const modifiable = results?.find((r) => r.modifiable);
-  if (!modifiable) {
-    throw new Error("No modifiable upcoming order found — nothing to amend");
-  }
-  return String(modifiable.orderId);
-}
-
-// Unlocks a submitted order for editing. Mirrors clicking "Amend" in the app.
-// ⚠️ Reverse-engineered from appie-go; not confirmed working by its author.
-async function reopenOrder(accessToken: string, orderId: string): Promise<void> {
-  const mutation = `mutation OrderReopen($id: Int!) {
-    orderReopen(id: $id) { status errorMessage }
-  }`;
-  const data = await doGraphQL(accessToken, mutation, { id: Number(orderId) });
-  const result = data.orderReopen as { status: string; errorMessage?: string };
-  if (result?.status !== "SUCCESS") {
-    throw new Error(`reopen order failed: ${result?.errorMessage ?? "unknown error"}`);
-  }
-}
-
-// Re-submits a reopened order. Must always be called after reopenOrder,
-// even if adding items failed, so the order is never left dangling open.
-// ⚠️ Reverse-engineered from appie-go; not confirmed working by its author.
-async function revertOrder(accessToken: string, orderId: string): Promise<void> {
-  const mutation = `mutation OrderRevert($id: Int!) {
-    orderRevert(id: $id) { status errorMessage }
-  }`;
-  const data = await doGraphQL(accessToken, mutation, { id: Number(orderId) });
-  const result = data.orderRevert as { status: string; errorMessage?: string };
-  if (result?.status !== "SUCCESS") {
-    throw new Error(`revert order failed: ${result?.errorMessage ?? "unknown error"}`);
-  }
-}
-
-async function addToCart(
-  accessToken: string,
-  orderId: string,
-  items: { productId: number; quantity: number }[]
-): Promise<void> {
+// The order endpoint sets quantities (it doesn't increment) and rejects
+// duplicate product IDs, so merge duplicates and add on top of what's there.
+async function addToOrder(accessToken: string, order: ActiveOrder, items: ProductToAdd[]): Promise<void> {
+  const merged = new Map<number, number>();
+  for (const i of items) merged.set(i.productId, (merged.get(i.productId) ?? 0) + i.quantity);
   const resp = await fetch(`${AH_API_BASE}/mobile-services/order/v1/items?sortBy=DEFAULT`, {
     method: "PUT",
-    headers: ahHeaders(accessToken, orderId),
+    headers: ahHeaders(accessToken, order.id),
     body: JSON.stringify({
-      items: items.map((i) => ({
-        productId: i.productId,
-        quantity: i.quantity,
+      items: [...merged].map(([productId, quantity]) => ({
+        productId,
+        quantity: quantity + (order.quantities.get(productId) ?? 0),
         originCode: "PRD",
         description: "",
         strikethrough: false,
@@ -201,15 +160,200 @@ async function addToCart(
     }),
   });
   if (!resp.ok) {
-    throw new Error(`add to cart failed: ${resp.status} ${await resp.text()}`);
+    throw new Error(`add to order failed: ${resp.status} ${await resp.text()}`);
   }
 }
 
-interface SyncResult {
+// Adds products and/or free-text items to the AH shopping list ("Mijn lijst").
+async function addToShoppingList(
+  accessToken: string,
+  items: { productId?: number; description: string; quantity: number }[]
+): Promise<void> {
+  const resp = await fetch(`${AH_API_BASE}/mobile-services/shoppinglist/v2/items`, {
+    method: "PATCH",
+    headers: ahHeaders(accessToken),
+    body: JSON.stringify({
+      items: items.map((i) => ({
+        description: i.description,
+        ...(i.productId ? { productId: i.productId, searchTerm: i.description } : {}),
+        quantity: i.quantity,
+        type: "SHOPPABLE",
+        originCode: "PRD",
+        strikeThrough: false,
+      })),
+    }),
+  });
+  if (!resp.ok) {
+    throw new Error(`add to shopping list failed: ${resp.status} ${await resp.text()}`);
+  }
+}
+
+type Destination = "order" | "list";
+
+// Writes resolved products to the open order (or the shopping list if none)
+// and leftover lines to the shopping list as free text.
+async function writeItems(
+  accessToken: string,
+  products: (ProductToAdd & { title: string })[],
+  leftovers: string[]
+): Promise<Destination> {
+  const order = products.length > 0 ? await getActiveOrder(accessToken) : null;
+  const destination: Destination = order ? "order" : "list";
+  const listItems: { productId?: number; description: string; quantity: number }[] = leftovers.map(
+    (description) => ({ description, quantity: 1 })
+  );
+  if (order) {
+    if (products.length > 0) await addToOrder(accessToken, order, products);
+  } else {
+    listItems.push(...products.map((p) => ({ productId: p.productId, description: p.title, quantity: p.quantity })));
+  }
+  if (listItems.length > 0) await addToShoppingList(accessToken, listItems);
+  return destination;
+}
+
+type Alias = { productId: number; title: string };
+
+// Hand-pinned aliases in code win over ones learned from confirmed picks.
+async function loadAliases(env: Env): Promise<Record<string, Alias>> {
+  const learned = await env.AH_TOKENS.get<Record<string, Alias>>(LEARNED_ALIASES_KV_KEY, "json");
+  return { ...(learned ?? {}), ...ALIASES };
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+// A Claude pick awaiting review, stored in KV between resolve and commit.
+interface PendingPick {
+  label: string;
   input: string;
-  status: "added" | "not_found" | "error";
-  title?: string;
-  error?: string;
+  name: string;
+  quantity: number;
+  productId: number;
+  title: string;
+}
+
+function parseItems(body: unknown): string[] | Response {
+  const rawItems = (body as { items?: unknown })?.items;
+  // Shortcuts sometimes coerces a List into a single newline-joined string
+  // when it lands in a JSON body field — accept that shape too.
+  const itemList: unknown =
+    typeof rawItems === "string" ? rawItems.split(/\r?\n/) : rawItems;
+  if (
+    (itemList !== undefined && !Array.isArray(itemList)) ||
+    (Array.isArray(itemList) && itemList.some((i) => typeof i !== "string"))
+  ) {
+    return Response.json(
+      { error: `"items" must be an array of strings, got: ${JSON.stringify(rawItems)}` },
+      { status: 400 }
+    );
+  }
+  return ((itemList as string[] | undefined) ?? []).map((s) => s.trim()).filter(Boolean);
+}
+
+async function handleResolve(env: Env, items: string[]): Promise<Response> {
+  if (items.length === 0) {
+    return Response.json({ runId: null, destination: null, completed: [], review: [], leftovers: [] });
+  }
+  const accessToken = await getAccessToken(env);
+  const aliases = await loadAliases(env);
+  const normalized = await normalizeItems(env.ANTHROPIC_API_KEY, items, Object.keys(aliases));
+  console.log("normalized", JSON.stringify(normalized));
+
+  const products: (ProductToAdd & { title: string })[] = [];
+  const completed: string[] = [];
+  const leftovers: string[] = [];
+  const toSearch: { input: string; name: string; quantity: number; searchTerm: string }[] = [];
+
+  items.forEach((input, i) => {
+    const n = normalized[i];
+    const alias = aliases[n.name.toLowerCase()];
+    if (alias) {
+      products.push({ productId: alias.productId, quantity: n.quantity, title: alias.title });
+      completed.push(input);
+    } else if (toSearch.length < MAX_SEARCHES) {
+      toSearch.push({ input, name: n.name.toLowerCase(), quantity: n.quantity, searchTerm: n.searchTerm });
+    } else {
+      leftovers.push(input);
+    }
+  });
+
+  const searched = await mapLimit(toSearch, SEARCH_CONCURRENCY, async (it) => {
+    try {
+      const candidates = await searchProducts(accessToken, it.searchTerm);
+      console.log(`search "${it.searchTerm}": ${candidates.length} results`);
+      return { ...it, candidates };
+    } catch (err) {
+      console.error(String(err));
+      return { ...it, candidates: [] as Candidate[] };
+    }
+  });
+  const picks = await pickBestMatches(env.ANTHROPIC_API_KEY, PREFERENCES, searched);
+
+  const pending: PendingPick[] = [];
+  searched.forEach((it, i) => {
+    const pick = picks[i];
+    if (!pick) {
+      leftovers.push(it.input);
+      return;
+    }
+    pending.push({
+      label: `${it.input} → ${pick.title} ×${it.quantity} (€${pick.price.toFixed(2)})`,
+      input: it.input,
+      name: it.name,
+      quantity: it.quantity,
+      productId: pick.productId,
+      title: pick.title,
+    });
+  });
+
+  const destination = await writeItems(accessToken, products, leftovers);
+  const runId = crypto.randomUUID();
+  if (pending.length > 0) {
+    await env.AH_TOKENS.put(`run:${runId}`, JSON.stringify(pending), { expirationTtl: RUN_TTL_SECONDS });
+  }
+  return Response.json({
+    runId,
+    destination,
+    completed,
+    review: pending.map((p) => p.label),
+    leftovers,
+  });
+}
+
+async function handleCommit(env: Env, runId: unknown, chosen: unknown): Promise<Response> {
+  if (typeof runId !== "string" || !Array.isArray(chosen)) {
+    return Response.json({ error: `expected { runId: string, chosen: string[] }` }, { status: 400 });
+  }
+  const pending = await env.AH_TOKENS.get<PendingPick[]>(`run:${runId}`, "json");
+  if (!pending) {
+    return Response.json({ error: `unknown or expired runId: ${runId}` }, { status: 404 });
+  }
+  const chosenLabels = new Set(chosen.map(String));
+  const confirmed = pending.filter((p) => chosenLabels.has(p.label));
+  const leftovers = pending.filter((p) => !chosenLabels.has(p.label)).map((p) => p.input);
+
+  const accessToken = await getAccessToken(env);
+  const destination = await writeItems(accessToken, confirmed, leftovers);
+
+  if (confirmed.length > 0) {
+    const learned =
+      (await env.AH_TOKENS.get<Record<string, Alias>>(LEARNED_ALIASES_KV_KEY, "json")) ?? {};
+    for (const p of confirmed) learned[p.name] = { productId: p.productId, title: p.title };
+    await env.AH_TOKENS.put(LEARNED_ALIASES_KV_KEY, JSON.stringify(learned));
+  }
+  await env.AH_TOKENS.delete(`run:${runId}`);
+
+  return Response.json({ destination, completed: confirmed.map((p) => p.input), leftovers });
 }
 
 export default {
@@ -223,7 +367,7 @@ export default {
 
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (request.method !== "POST" || url.pathname !== "/sync") {
+    if (request.method !== "POST" || !["/resolve", "/commit"].includes(url.pathname)) {
       return new Response("Not found", { status: 404 });
     }
     if (request.headers.get("Authorization") !== `Bearer ${env.SYNC_SECRET}`) {
@@ -236,101 +380,17 @@ export default {
     } catch {
       return new Response("Invalid JSON", { status: 400 });
     }
-    const rawItems = (body as { items?: unknown })?.items;
-    // Shortcuts sometimes coerces a List into a single newline-joined string
-    // when it lands in a JSON body field — accept that shape too.
-    const itemList: unknown =
-      typeof rawItems === "string" ? rawItems.split(/\r?\n/) : rawItems;
-    if (itemList !== undefined && !Array.isArray(itemList)) {
-      return Response.json(
-        { error: `"items" must be an array of strings, got: ${JSON.stringify(rawItems)}` },
-        { status: 400 }
-      );
-    }
-    if (Array.isArray(itemList) && itemList.some((i) => typeof i !== "string")) {
-      return Response.json(
-        { error: `"items" must be an array of strings, got: ${JSON.stringify(rawItems)}` },
-        { status: 400 }
-      );
-    }
-    const items = ((itemList as string[] | undefined) ?? []).map((s) => s.trim()).filter(Boolean);
-    if (items.length === 0) {
-      return Response.json({ results: [] satisfies SyncResult[] });
-    }
 
-    let accessToken: string;
     try {
-      accessToken = await getAccessToken(env);
+      if (url.pathname === "/resolve") {
+        const items = parseItems(body);
+        return items instanceof Response ? items : await handleResolve(env, items);
+      }
+      const { runId, chosen } = (body ?? {}) as { runId?: unknown; chosen?: unknown };
+      return await handleCommit(env, runId, chosen);
     } catch (err) {
+      console.error(String(err));
       return Response.json({ error: String(err) }, { status: 500 });
     }
-
-    const results: SyncResult[] = [];
-    const toAdd: { productId: number; quantity: number; title: string; input: string }[] = [];
-
-    for (const raw of items) {
-      const alias = ALIASES[raw.toLowerCase()];
-      if (alias) {
-        toAdd.push({ productId: alias.productId, quantity: 1, title: alias.title, input: raw });
-        continue;
-      }
-      try {
-        const searchTerm = await translateToSearchTerm(env.ANTHROPIC_API_KEY, raw);
-        const candidates = await searchProducts(accessToken, searchTerm);
-        const found = await pickBestMatch(env.ANTHROPIC_API_KEY, raw, PREFERENCES, candidates);
-        if (found) {
-          toAdd.push({ productId: found.productId, quantity: 1, title: found.title, input: raw });
-        } else {
-          results.push({ input: raw, status: "not_found" });
-        }
-      } catch (err) {
-        results.push({ input: raw, status: "error", error: String(err) });
-      }
-    }
-
-    let warning: string | undefined;
-
-    if (toAdd.length > 0) {
-      let orderId: string;
-      let reopenedOrderId: string | null = null;
-      try {
-        try {
-          orderId = await getActiveOrderId(accessToken);
-        } catch {
-          // No unsubmitted cart — this week's order is already placed, so
-          // reopen it for editing (same as tapping "Amend" in the app).
-          orderId = await getModifiableOrderId(accessToken);
-          await reopenOrder(accessToken, orderId);
-          reopenedOrderId = orderId;
-        }
-
-        try {
-          await addToCart(
-            accessToken,
-            orderId,
-            toAdd.map((i) => ({ productId: i.productId, quantity: i.quantity }))
-          );
-          for (const item of toAdd) {
-            results.push({ input: item.input, status: "added", title: item.title });
-          }
-        } finally {
-          if (reopenedOrderId) {
-            try {
-              await revertOrder(accessToken, reopenedOrderId);
-            } catch (revertErr) {
-              warning =
-                `Order ${reopenedOrderId} was reopened for editing but could not be ` +
-                `resubmitted — check the AH app manually. (${String(revertErr)})`;
-            }
-          }
-        }
-      } catch (err) {
-        for (const item of toAdd) {
-          results.push({ input: item.input, status: "error", title: item.title, error: String(err) });
-        }
-      }
-    }
-
-    return Response.json({ results, ...(warning ? { warning } : {}) });
   },
 };
