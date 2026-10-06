@@ -104,6 +104,7 @@ export interface Candidate {
   price: number;
   isBonus: boolean;
   propertyIcons: string[];
+  imageUrl?: string;
 }
 
 // Picks the best candidate for each item given standing preferences, in one

@@ -11,7 +11,10 @@ reopen/resubmit "amend" fallback).
 
 ## Decision
 
-- Split into `/resolve` and `/commit` with a review step in the Shortcut. Aliased items are
+- Split into resolve and commit with a review step in between, on a web page served by
+  the Worker (not in Shortcuts, which is painful to edit; the Shortcut is a fixed four
+  actions). The page has no bearer secret — the unguessable, day-long run id is the
+  credential. Aliased items are
   added immediately; every LLM pick is reviewed; ticked picks become learned aliases.
 - Batch Claude to two calls per resolve (normalise, pick) and cap AH searches so a request
   stays under 50 subrequests on the free plan.
@@ -22,6 +25,7 @@ reopen/resubmit "amend" fallback).
 ## Consequences
 
 - Review effort is front-loaded and shrinks as aliases are learned.
+- Reminders are cleared by hand from the done page's list; a web page can't edit them.
 - Leftover reminders stay open, so their free-text items can be re-added on the next run
   (AH's list read doesn't return free-text descriptions to de-duplicate against).
 - Moving off Cloudflare stays the fallback if the cap or AH's 403s keep biting.

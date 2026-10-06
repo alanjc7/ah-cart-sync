@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker, { type Env } from "../src/index";
+import type { Run } from "../src/review";
 
 // In-memory stand-in for the AH_TOKENS KV namespace.
 function memoryKV(): KVNamespace {
@@ -85,16 +86,29 @@ function makeEnv(): Env {
   return { AH_TOKENS: kv, SYNC_SECRET: "s", ANTHROPIC_API_KEY: "k" };
 }
 
-async function post(env: Env, path: string, body: unknown) {
+async function resolve(env: Env, items: unknown) {
   const resp = await worker.fetch(
-    new Request(`https://w.test${path}`, {
+    new Request("https://w.test/resolve", {
       method: "POST",
       headers: { Authorization: "Bearer s" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ items }),
     }),
     env
   );
-  return { status: resp.status, json: (await resp.json()) as any };
+  const { runId } = (await resp.json()) as { runId: string };
+  const run = (await env.AH_TOKENS.get(`run:${runId}`, "json")) as Run;
+  return { runId, run };
+}
+
+// Submits the review page's form with the given picks ticked.
+async function submitReview(env: Env, runId: string, chosen: number[]) {
+  const form = new FormData();
+  for (const i of chosen) form.append("chosen", String(i));
+  const resp = await worker.fetch(
+    new Request(`https://w.test/review/${runId}`, { method: "POST", body: form }),
+    env
+  );
+  return { status: resp.status, run: (await env.AH_TOKENS.get(`run:${runId}`, "json")) as Run };
 }
 
 afterEach(() => vi.unstubAllGlobals());
@@ -105,12 +119,11 @@ describe("weekly list", () => {
     const ah = fakeUpstreams({ order: [] });
     const items = Array.from({ length: 45 }, (_, i) => `thing ${i}`);
 
-    const { status, json } = await post(env, "/resolve", { items });
+    const { run } = await resolve(env, items);
 
-    expect(status).toBe(200);
     expect(ah.calls.length).toBeLessThan(50);
-    expect(json.review).toHaveLength(40);
-    expect(json.leftovers).toEqual(items.slice(40));
+    expect(run.picks).toHaveLength(40);
+    expect(run.leftovers).toEqual(items.slice(40));
     expect(ah.listPatch()).toEqual(
       items.slice(40).map((description) => expect.objectContaining({ description, quantity: 1 }))
     );
@@ -121,10 +134,10 @@ describe("weekly list", () => {
     // 382907 is the "milk" alias.
     const ah = fakeUpstreams({ order: [{ webshopId: 382907, quantity: 1 }] });
 
-    const { json } = await post(env, "/resolve", { items: ["milk", "2 x milk"] });
+    const { run } = await resolve(env, ["milk", "2 x milk"]);
 
-    expect(json.destination).toBe("order");
-    expect(json.completed).toEqual(["milk", "2 x milk"]);
+    expect(run.destination).toBe("order");
+    expect(run.completed).toEqual(["milk", "2 x milk"]);
     expect(ah.orderPut()).toEqual([expect.objectContaining({ productId: 382907, quantity: 4 })]);
   });
 
@@ -132,9 +145,9 @@ describe("weekly list", () => {
     const env = makeEnv();
     const ah = fakeUpstreams({ order: null });
 
-    const { json } = await post(env, "/resolve", { items: ["3 x bananas"] });
+    const { run } = await resolve(env, ["3 x bananas"]);
 
-    expect(json.destination).toBe("list");
+    expect(run.destination).toBe("list");
     expect(ah.orderPut()).toBeUndefined();
     expect(ah.listPatch()).toEqual([expect.objectContaining({ productId: 368480, quantity: 3 })]);
   });
@@ -143,22 +156,27 @@ describe("weekly list", () => {
     const env = makeEnv();
     let ah = fakeUpstreams({ order: [] });
 
-    const resolved = await post(env, "/resolve", { items: ["oat milk", "feta"] });
-    expect(resolved.json.completed).toEqual([]);
-    expect(resolved.json.review).toHaveLength(2);
-    const oatMilkLabel = resolved.json.review.find((l: string) => l.startsWith("oat milk"));
+    const { runId, run } = await resolve(env, ["oat milk", "feta"]);
+    expect(run.completed).toEqual([]);
+    expect(run.picks.map((p) => p.input)).toEqual(["oat milk", "feta"]);
 
     ah = fakeUpstreams({ order: [] });
-    const committed = await post(env, "/commit", { runId: resolved.json.runId, chosen: [oatMilkLabel] });
-    expect(committed.json).toEqual({ destination: "order", completed: ["oat milk"], leftovers: ["feta"] });
+    const committed = await submitReview(env, runId, [0]);
+    expect(committed.status).toBe(303);
+    expect(committed.run.committed).toEqual({ completed: ["oat milk"], leftovers: ["feta"] });
     expect(ah.orderPut()).toEqual([expect.objectContaining({ quantity: 1 })]);
     expect(ah.listPatch()).toEqual([expect.objectContaining({ description: "feta" })]);
 
+    // Submitting again (reload, double tap) adds nothing more.
+    ah = fakeUpstreams({ order: [] });
+    await submitReview(env, runId, [0, 1]);
+    expect(ah.calls).toEqual([]);
+
     // Next week, oat milk is a learned alias: added straight away, no review.
     ah = fakeUpstreams({ order: [] });
-    const nextWeek = await post(env, "/resolve", { items: ["Oat milk"] });
-    expect(nextWeek.json.completed).toEqual(["Oat milk"]);
-    expect(nextWeek.json.review).toEqual([]);
+    const nextWeek = await resolve(env, ["Oat milk"]);
+    expect(nextWeek.run.completed).toEqual(["Oat milk"]);
+    expect(nextWeek.run.picks).toEqual([]);
     expect(ah.calls.some((c) => c.url.includes("/search/"))).toBe(false);
   });
 });

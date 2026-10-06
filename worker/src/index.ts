@@ -1,5 +1,6 @@
 import { ALIASES } from "./aliases";
 import { PREFERENCES } from "./preferences";
+import { renderDone, renderError, renderMissing, renderReview, type PendingPick, type Run } from "./review";
 import { normalizeItems, pickBestMatches, type Candidate } from "./llm";
 
 export interface Env {
@@ -97,6 +98,7 @@ async function searchProducts(accessToken: string, query: string): Promise<Candi
       priceBeforeBonus?: number;
       isBonus?: boolean;
       propertyIcons?: string[];
+      images?: { url: string; width: number }[];
     }[];
   };
   return (data.products ?? []).map((p) => ({
@@ -106,6 +108,7 @@ async function searchProducts(accessToken: string, query: string): Promise<Candi
     price: p.currentPrice || p.priceBeforeBonus || 0,
     isBonus: p.isBonus ?? false,
     propertyIcons: p.propertyIcons ?? [],
+    imageUrl: (p.images?.find((img) => img.width >= 150) ?? p.images?.[0])?.url,
   }));
 }
 
@@ -232,16 +235,6 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
   return results;
 }
 
-// A Claude pick awaiting review, stored in KV between resolve and commit.
-interface PendingPick {
-  label: string;
-  input: string;
-  name: string;
-  quantity: number;
-  productId: number;
-  title: string;
-}
-
 function parseItems(body: unknown): string[] | Response {
   const rawItems = (body as { items?: unknown })?.items;
   // Shortcuts sometimes coerces a List into a single newline-joined string
@@ -260,13 +253,13 @@ function parseItems(body: unknown): string[] | Response {
   return ((itemList as string[] | undefined) ?? []).map((s) => s.trim()).filter(Boolean);
 }
 
-async function handleResolve(env: Env, items: string[]): Promise<Response> {
-  if (items.length === 0) {
-    return Response.json({ runId: null, destination: null, completed: [], review: [], leftovers: [] });
-  }
+// Adds aliased items, searches + picks the rest, and stores the run for the
+// review page. Returns the stored run's id.
+async function resolve(env: Env, items: string[]): Promise<string> {
   const accessToken = await getAccessToken(env);
   const aliases = await loadAliases(env);
-  const normalized = await normalizeItems(env.ANTHROPIC_API_KEY, items, Object.keys(aliases));
+  const normalized =
+    items.length > 0 ? await normalizeItems(env.ANTHROPIC_API_KEY, items, Object.keys(aliases)) : [];
   console.log("normalized", JSON.stringify(normalized));
 
   const products: (ProductToAdd & { title: string })[] = [];
@@ -297,53 +290,40 @@ async function handleResolve(env: Env, items: string[]): Promise<Response> {
       return { ...it, candidates: [] as Candidate[] };
     }
   });
-  const picks = await pickBestMatches(env.ANTHROPIC_API_KEY, PREFERENCES, searched);
+  const chosen = await pickBestMatches(env.ANTHROPIC_API_KEY, PREFERENCES, searched);
 
-  const pending: PendingPick[] = [];
+  const picks: PendingPick[] = [];
   searched.forEach((it, i) => {
-    const pick = picks[i];
+    const pick = chosen[i];
     if (!pick) {
       leftovers.push(it.input);
       return;
     }
-    pending.push({
-      label: `${it.input} → ${pick.title} ×${it.quantity} (€${pick.price.toFixed(2)})`,
+    picks.push({
       input: it.input,
       name: it.name,
       quantity: it.quantity,
       productId: pick.productId,
       title: pick.title,
+      price: pick.price,
+      imageUrl: pick.imageUrl,
     });
   });
 
   const destination = await writeItems(accessToken, products, leftovers);
+  const run: Run = { destination, completed, leftovers, picks };
   const runId = crypto.randomUUID();
-  if (pending.length > 0) {
-    await env.AH_TOKENS.put(`run:${runId}`, JSON.stringify(pending), { expirationTtl: RUN_TTL_SECONDS });
-  }
-  return Response.json({
-    runId,
-    destination,
-    completed,
-    review: pending.map((p) => p.label),
-    leftovers,
-  });
+  await env.AH_TOKENS.put(`run:${runId}`, JSON.stringify(run), { expirationTtl: RUN_TTL_SECONDS });
+  return runId;
 }
 
-async function handleCommit(env: Env, runId: unknown, chosen: unknown): Promise<Response> {
-  if (typeof runId !== "string" || !Array.isArray(chosen)) {
-    return Response.json({ error: `expected { runId: string, chosen: string[] }` }, { status: 400 });
-  }
-  const pending = await env.AH_TOKENS.get<PendingPick[]>(`run:${runId}`, "json");
-  if (!pending) {
-    return Response.json({ error: `unknown or expired runId: ${runId}` }, { status: 404 });
-  }
-  const chosenLabels = new Set(chosen.map(String));
-  const confirmed = pending.filter((p) => chosenLabels.has(p.label));
-  const leftovers = pending.filter((p) => !chosenLabels.has(p.label)).map((p) => p.input);
+// Adds the ticked picks, learns them as aliases, and free-texts the rest.
+async function commit(env: Env, runId: string, run: Run, chosenIndexes: Set<number>): Promise<void> {
+  const confirmed = run.picks.filter((_, i) => chosenIndexes.has(i));
+  const leftovers = run.picks.filter((_, i) => !chosenIndexes.has(i)).map((p) => p.input);
 
   const accessToken = await getAccessToken(env);
-  const destination = await writeItems(accessToken, confirmed, leftovers);
+  await writeItems(accessToken, confirmed, leftovers);
 
   if (confirmed.length > 0) {
     const learned =
@@ -351,9 +331,29 @@ async function handleCommit(env: Env, runId: unknown, chosen: unknown): Promise<
     for (const p of confirmed) learned[p.name] = { productId: p.productId, title: p.title };
     await env.AH_TOKENS.put(LEARNED_ALIASES_KV_KEY, JSON.stringify(learned));
   }
-  await env.AH_TOKENS.delete(`run:${runId}`);
 
-  return Response.json({ destination, completed: confirmed.map((p) => p.input), leftovers });
+  run.committed = { completed: confirmed.map((p) => p.input), leftovers };
+  await env.AH_TOKENS.put(`run:${runId}`, JSON.stringify(run), { expirationTtl: RUN_TTL_SECONDS });
+}
+
+// The review page is reached from the Shortcut via Safari, which can't send
+// the bearer secret — the unguessable, expiring runId is the credential.
+async function handleReview(request: Request, env: Env, runId: string): Promise<Response> {
+  const run = await env.AH_TOKENS.get<Run>(`run:${runId}`, "json");
+  if (!run) return renderMissing();
+  if (run.committed || run.picks.length === 0) return renderDone(run);
+  if (request.method !== "POST") return renderReview(run);
+
+  const form = await request.formData();
+  const chosen = new Set(form.getAll("chosen").map((v) => Number(v)));
+  try {
+    await commit(env, runId, run, chosen);
+  } catch (err) {
+    console.error(String(err));
+    return renderReview(run, `Couldn't add items: ${String(err)}`);
+  }
+  // Post/redirect/get, so a reload doesn't resubmit.
+  return Response.redirect(request.url, 303);
 }
 
 export default {
@@ -367,7 +367,17 @@ export default {
 
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (request.method !== "POST" || !["/resolve", "/commit"].includes(url.pathname)) {
+
+    const review = url.pathname.match(/^\/review\/([0-9a-f-]{36})$/);
+    if (review && (request.method === "GET" || request.method === "POST")) {
+      return handleReview(request, env, review[1]);
+    }
+
+    if (request.method === "GET" && url.pathname === "/error") {
+      return renderError(url.searchParams.get("message") ?? "Unknown error");
+    }
+
+    if (request.method !== "POST" || url.pathname !== "/resolve") {
       return new Response("Not found", { status: 404 });
     }
     if (request.headers.get("Authorization") !== `Bearer ${env.SYNC_SECRET}`) {
@@ -380,17 +390,25 @@ export default {
     } catch {
       return new Response("Invalid JSON", { status: 400 });
     }
+    const items = parseItems(body);
+    if (items instanceof Response) return items;
 
+    let runId: string;
     try {
-      if (url.pathname === "/resolve") {
-        const items = parseItems(body);
-        return items instanceof Response ? items : await handleResolve(env, items);
-      }
-      const { runId, chosen } = (body ?? {}) as { runId?: unknown; chosen?: unknown };
-      return await handleCommit(env, runId, chosen);
+      runId = await resolve(env, items);
     } catch (err) {
       console.error(String(err));
+      if (url.searchParams.get("format") === "url") {
+        const message = new URLSearchParams({ message: String(err) });
+        return new Response(`${url.origin}/error?${message}`, { headers: { "content-type": "text/plain" } });
+      }
       return Response.json({ error: String(err) }, { status: 500 });
     }
+    const reviewUrl = `${url.origin}/review/${runId}`;
+    // The Shortcut asks for a bare URL so it can feed it straight to "Open URLs".
+    if (url.searchParams.get("format") === "url") {
+      return new Response(reviewUrl, { headers: { "content-type": "text/plain" } });
+    }
+    return Response.json({ runId, reviewUrl });
   },
 };

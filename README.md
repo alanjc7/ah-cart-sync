@@ -6,7 +6,7 @@ tap on your phone.
 **How it works:** an iOS Shortcut reads your shared Reminders list and sends the lines to a
 small Cloudflare Worker. Claude parses every line in one go (quantity, name, Dutch search
 term). Anything matching an alias is added straight away; everything else is searched on AH
-and Claude picks a match, which you tick or untick in a list on your phone before it's
+and Claude picks a match, which you tick or untick on a review page on your phone before it's
 added. Ticked picks are remembered as aliases, so the review list shrinks week by week.
 Items go to your open order if there is one, otherwise to your AH shopping list; anything
 unmatched or unticked lands on the AH shopping list as free text, to handle by hand.
@@ -97,37 +97,33 @@ export const ALIASES: Record<string, { productId: number; title: string }> = {
 
 Redeploy with `npx wrangler deploy` after editing. Aliases in `aliases.ts` always win.
 
-You don't *have* to maintain this file: every pick you tick in the Shortcut's review list is
+You don't *have* to maintain this file: every pick you tick on the review page is
 saved as a **learned alias** (in KV) and is added without review from then on. Use
 `aliases.ts` to pin a specific product or override a learned one. Standing preferences for
 Claude's picks live in `worker/src/preferences.ts` (plain English).
 
 ## 4. Build the iOS Shortcut
 
-Create a new Shortcut with these actions, in order (`<list>` is your shared list name,
-`<url>` your Worker URL, and each request has headers
-`Authorization: Bearer <your SYNC_SECRET>` and `Content-Type: application/json`):
+The Shortcut only collects the list and opens a web page; everything else (review, results)
+lives in the Worker, so it never needs editing again. Four actions:
 
-1. **Find Reminders** where List is `<list>` and Is Not Completed.
-2. **Get Details of Reminders** → *Title* (gives a list of item lines).
-3. **Get Contents of URL**: POST `<url>/resolve`, JSON body `{ "items": <Title> }`.
-   Call the result *Resolved*.
-4. **Get Dictionary Value** `review` from *Resolved*.
-5. **If** *Count* of that is greater than 0:
-   - **Choose from List** (`review`), *Select Multiple* on. Tick the picks you want.
-   - **Get Contents of URL**: POST `<url>/commit`, JSON body
-     `{ "runId": <runId from Resolved>, "chosen": <Chosen Item> }`. Call it *Committed*.
-6. For each of `completed` from *Resolved* and `completed` from *Committed*:
-   **Repeat with Each** → **Find Reminders** where List is `<list>`, Title is *Repeat Item*
-   and Is Not Completed → **Mark as Completed** (on older iOS: **Edit Reminder**, set
-   *Is Completed*).
-7. **Show Notification** with `leftovers` (the lines left for you on the AH shopping list).
-
-Reminders added only as free text stay open on purpose, so the shared list shows what
-still needs doing. Cancelling the review list stops the run before `/commit`: those picks
-aren't added and their reminders stay open for next time.
+1. **Find Reminders** — tap *Add Filter*: List is `<your shared list>`; add another filter:
+   Is Not Completed.
+2. **Get Details of Reminders** — set it to *Title*.
+3. **Get Contents of URL**
+   - URL: `https://ah-cart-sync.<you>.workers.dev/resolve?format=url`
+   - Method: POST
+   - Headers: `Authorization` = `Bearer <your SYNC_SECRET>`
+   - Request Body: JSON, add field `items` (type *Text*) = the *Title* variable from step 2
+4. **Open URLs** — input is *Contents of URL* from step 3.
 
 Long-press the Shortcut → **Add to Home Screen** so it's a one-tap icon.
+
+Tapping it opens a review page in Safari: aliased items are already added, and Claude's
+picks are listed ticked — untick anything wrong and press **Add ticked items**. The done page
+then tells you which reminders to clear (added as products) and which to leave open (put on
+the AH shopping list as free text for you to sort out by hand). The page link expires after
+a day.
 
 ## Tests
 
