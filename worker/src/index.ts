@@ -168,15 +168,22 @@ async function addToOrder(accessToken: string, order: ActiveOrder, items: Produc
 }
 
 // Adds products and/or free-text items to the AH shopping list ("Mijn lijst").
+// Like the order endpoint, it rejects duplicates, so merge them first.
 async function addToShoppingList(
   accessToken: string,
   items: { productId?: number; description: string; quantity: number }[]
 ): Promise<void> {
+  const merged = new Map<string, (typeof items)[number]>();
+  for (const i of items) {
+    const key = i.productId ? `p:${i.productId}` : `t:${i.description.toLowerCase()}`;
+    const existing = merged.get(key);
+    merged.set(key, existing ? { ...existing, quantity: existing.quantity + i.quantity } : i);
+  }
   const resp = await fetch(`${AH_API_BASE}/mobile-services/shoppinglist/v2/items`, {
     method: "PATCH",
     headers: ahHeaders(accessToken),
     body: JSON.stringify({
-      items: items.map((i) => ({
+      items: [...merged.values()].map((i) => ({
         description: i.description,
         ...(i.productId ? { productId: i.productId, searchTerm: i.description } : {}),
         quantity: i.quantity,

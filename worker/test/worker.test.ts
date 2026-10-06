@@ -152,6 +152,16 @@ describe("weekly list", () => {
     expect(ah.listPatch()).toEqual([expect.objectContaining({ productId: 368480, quantity: 3 })]);
   });
 
+  it("merges duplicate products on the shopping list too", async () => {
+    const env = makeEnv();
+    const ah = fakeUpstreams({ order: null });
+
+    // Both are aliases for the same toilet paper product.
+    await resolve(env, ["toilet roll", "2 x toilet paper"]);
+
+    expect(ah.listPatch()).toEqual([expect.objectContaining({ productId: 595095, quantity: 3 })]);
+  });
+
   it("commits ticked picks, frees the rest as text, and learns the ticked ones", async () => {
     const env = makeEnv();
     let ah = fakeUpstreams({ order: [] });
