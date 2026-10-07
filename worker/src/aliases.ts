@@ -52,4 +52,6 @@ export const ALIASES: Record<string, { productId: number; title: string }> = {
   "kidney beans": {productId: 30428, title: "AH Terra Kidneybonen"},
   "chickpeas": {productId: 168813, title: "AH Terra Biologisch kikkererwten"},
   "fake meat": {productId: 564798, title: "AH Terra Terra plantaardige rulgehakt"},
+  weetabix: {productId: 162236, title: "Weetabix Original"},
+  "green olives": {productId: 199923, title: "AH Biologisch Groene olijven zonder pit"},
 };
