@@ -122,7 +122,9 @@ function ahHeaders(accessToken, orderId) {
 
 // ---------------------------------------------------------------- AH
 
-async function getAccessToken() {
+// On a refused refresh token, asks for a fresh one (from `appie login` on the
+// Mac) and retries once.
+async function getAccessToken(retried = false) {
   const tokens = JSON.parse(Keychain.get(KEY_TOKENS));
   if (tokens.expires_at - REFRESH_BUFFER_MS > Date.now()) return tokens.access_token;
 
@@ -132,10 +134,15 @@ async function getAccessToken() {
     body: { clientId: CLIENT_ID, refreshToken: tokens.refresh_token },
   });
   if (!resp.ok) {
-    throw new Error(
-      `AH login expired or refused (${resp.status}). Log in again with ah-mcp and ` +
-        `re-enter the refresh token (README). ${resp.text.slice(0, 200)}`
+    console.error(`token refresh refused: ${resp.status} ${resp.text.slice(0, 300)}`);
+    if (retried) throw new Error(`AH refused the new refresh token too (${resp.status}): ${resp.text.slice(0, 200)}`);
+    const refresh = await ask(
+      `AH login expired (${resp.status})`,
+      "Log in on your Mac with `appie login` and paste the new refresh token",
+      ""
     );
+    Keychain.set(KEY_TOKENS, JSON.stringify({ access_token: "", refresh_token: refresh, expires_at: 0 }));
+    return getAccessToken(true);
   }
   const data = JSON.parse(resp.text);
   Keychain.set(
