@@ -1,6 +1,6 @@
 # 1. Review step, shopping-list fallback, no amending placed orders
 
-Date: 2026-10-06 · Status: accepted
+Date: 2026-10-06 · Status: superseded by 0002 (hosting); review step and fallbacks still apply
 
 ## Context
 

@@ -1,132 +1,63 @@
 # ah-cart-sync
 
-Add items from a shared Reminders list to your Albert Heijn cart (next delivery) with one
+Add items from a shared Reminders list to your Albert Heijn order or shopping list with one
 tap on your phone.
 
-**How it works:** an iOS Shortcut reads your shared Reminders list and sends the lines to a
-small Cloudflare Worker. Claude parses every line in one go (quantity, name, Dutch search
-term). Anything matching an alias is added straight away; everything else is searched on AH
-and Claude picks a match, which you tick or untick on a review page on your phone before it's
-added. Ticked picks are remembered as aliases, so the review list shrinks week by week.
-Items go to your open order if there is one, otherwise to your AH shopping list; anything
-unmatched or unticked lands on the AH shopping list as free text, to handle by hand.
+**How it works:** a [Scriptable](https://scriptable.app) script on your iPhone reads the
+shared Reminders list. Each line is matched against your aliases (the line itself first,
+then Claude's reading of messier lines like "2 x big portobellos"). Everything else is
+searched on AH and Claude picks a product, which you tick or untick in a review list.
+Items go to your open order if there is one, otherwise to your AH shopping list; unmatched
+or unticked lines go on the AH shopping list as free text. Reminders for lines added as
+products are marked completed; the rest stay open. Ticked picks are remembered as aliases,
+so the review list shrinks week by week.
 
-This talks to Albert Heijn's private mobile-app API directly (reverse-engineered by the
-[appie-go](https://github.com/gwillem/appie-go) project); the LLM is only used for the
-parse/match steps, not for driving the automation itself.
+It runs on the phone, not a server, because AH's bot protection (Akamai) blocks requests
+from cloud servers. It talks to AH's private mobile-app API directly (reverse-engineered by
+[appie-go](https://github.com/gwillem/appie-go)); Claude only reads lines and picks
+products.
 
-## 1. One-time AH login (get a refresh token)
+## 1. AH login (get a refresh token)
 
-We reuse [ah-mcp](https://github.com/mrserzhan/ah-mcp) purely to do the interactive OAuth
-login once — no need to reimplement its browser/redirect-proxy trick.
-
-```bash
-git clone https://github.com/mrserzhan/ah-mcp
-cd ah-mcp
-go build -o ah-mcp .
-./ah-mcp --transport sse   # starts a local MCP server on :3000, opens no browser yet
-```
-
-In another terminal, connect to it with the official MCP inspector and call `ah_login`:
+On a Mac with Go installed:
 
 ```bash
-npx @modelcontextprotocol/inspector
+git clone https://github.com/gwillem/appie-go && cd appie-go
+go build -o appie ./cmd/appie
+./appie login                                         # opens the browser to log in
+jq -r .refresh_token ~/.config/appie/config.json | pbcopy
 ```
 
-- Open the inspector UI (it prints a URL), connect to `http://localhost:3000/sse` (SSE
-  transport).
-- Find the `ah_login` tool and run it. Your browser opens — log in with your AH account.
-- Tokens are now saved at `~/Library/Application Support/ah-mcp/tokens.json` (macOS).
+With Universal Clipboard the token is now pasteable on your iPhone. Don't run other
+`appie` commands afterwards: they can refresh the token on the Mac and invalidate the
+phone's copy.
 
-You can stop the `ah-mcp` server after this — it's not needed again.
+## 2. Install the script
 
-## 2. Deploy the Worker
+1. Install **Scriptable** from the App Store.
+2. In Finder, **⌥ Option-drag** `scriptable/AH Cart Sync.js` into iCloud Drive → Scriptable
+   (Option copies; a plain drag into iCloud Drive *moves* the file out of the repo).
+3. Run it in Scriptable. The first run asks for the Reminders list name, your Anthropic API
+   key and the AH refresh token, and stores them in the iOS Keychain. Allow Reminders access.
 
-```bash
-cd worker
-npm install
-npx wrangler login                        # if you haven't already
-npx wrangler kv namespace create AH_TOKENS
-```
+For one-tap use add it to the home screen via a Scriptable widget or a one-action
+Shortcut ("Run Script"), or ask Siri: "AH Cart Sync".
 
-Copy the returned `id` into `wrangler.toml` (`AH_TOKENS` binding).
+If AH ever refuses the token ("AH login expired"), the script asks for a new one: repeat
+step 1 and paste it.
 
-Seed the refresh token into KV from the tokens file saved in step 1:
+## 3. Aliases and preferences
 
-```bash
-REFRESH=$(jq -r .refresh_token ~/Library/Application\ Support/ah-mcp/tokens.json)
-npx wrangler kv key put --binding=AH_TOKENS tokens \
-  "{\"access_token\":\"\",\"refresh_token\":\"$REFRESH\",\"expires_at\":0}"
-```
+Pinned aliases live at the top of the script (`ALIASES`): lowercase item name → exact AH
+product. To find a `productId`, open the product on ah.nl; the URL has `wi<number>` — drop
+the `wi`. Pinned aliases always win.
 
-(`expires_at: 0` forces the Worker to refresh on its very first request.)
+Picks you tick in the review list are saved as **learned aliases** in
+`ah-cart-sync-aliases.json` next to the script (iCloud Drive → Scriptable), so you only
+need to pin the ones you want to force or correct.
 
-Set a secret the Shortcut will send as a bearer token — pick any long random string:
+Edit the script in one place only — either here (then Option-drag it over again) or in the
+Scriptable editor on the phone — or the two copies drift.
 
-```bash
-npx wrangler secret put SYNC_SECRET
-```
-
-Set your Anthropic API key (used to translate item names and pick the best product match
-for anything not in `aliases.ts` — see step 3):
-
-```bash
-npx wrangler secret put ANTHROPIC_API_KEY
-```
-
-Deploy:
-
-```bash
-npx wrangler deploy
-```
-
-Note the deployed URL (e.g. `https://ah-cart-sync.<you>.workers.dev`).
-
-## 3. Add your favourite product mappings
-
-Edit `worker/src/aliases.ts` — for each ambiguous or frequently-used item name, look up the
-exact product on ah.nl (the number in the URL, e.g. `ah.nl/producten/product/wi123456/...`,
-is the `webshopId`) and add it:
-
-```ts
-export const ALIASES: Record<string, { productId: number; title: string }> = {
-  hummus: { productId: 123456, title: "Maza Hummus Naturel 350g" },
-  melk: { productId: 234567, title: "AH Halfvolle Melk 1L" },
-};
-```
-
-Redeploy with `npx wrangler deploy` after editing. Aliases in `aliases.ts` always win.
-
-You don't *have* to maintain this file: every pick you tick on the review page is
-saved as a **learned alias** (in KV) and is added without review from then on. Use
-`aliases.ts` to pin a specific product or override a learned one. Standing preferences for
-Claude's picks live in `worker/src/preferences.ts` (plain English).
-
-## 4. Build the iOS Shortcut
-
-The Shortcut only collects the list and opens a web page; everything else (review, results)
-lives in the Worker, so it never needs editing again. Four actions:
-
-1. **Find Reminders** — tap *Add Filter*: List is `<your shared list>`; add another filter:
-   Is Not Completed.
-2. **Get Details of Reminders** — set it to *Title*.
-3. **Get Contents of URL**
-   - URL: `https://ah-cart-sync.<you>.workers.dev/resolve?format=url`
-   - Method: POST
-   - Headers: `Authorization` = `Bearer <your SYNC_SECRET>`
-   - Request Body: JSON, add field `items` (type *Text*) = the *Title* variable from step 2
-4. **Open URLs** — input is *Contents of URL* from step 3.
-
-Long-press the Shortcut → **Add to Home Screen** so it's a one-tap icon.
-
-Tapping it opens a review page in Safari: aliased items are already added, and Claude's
-picks are listed ticked — untick anything wrong and press **Add ticked items**. The done page
-then tells you which reminders to clear (added as products) and which to leave open (put on
-the AH shopping list as free text for you to sort out by hand). The page link expires after
-a day.
-
-## Tests
-
-```bash
-cd worker && npm test
-```
+`PREFERENCES` (plain English) steers Claude's picks, e.g. own-brand and organic unless a
+premium brand is on bonus.
