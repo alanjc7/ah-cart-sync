@@ -246,6 +246,7 @@ async function callClaude(system, userText, tool) {
     body: {
       model: CLAUDE_MODEL,
       max_tokens: 8000,
+      temperature: 0,
       system,
       messages: [{ role: "user", content: userText }],
       tools: [tool],
@@ -259,14 +260,16 @@ async function callClaude(system, userText, tool) {
 }
 
 // Parses free-form lines ("4 x bratwurst", "portobellos big x2") into
-// quantity, canonical English name and Dutch AH search term, in one call.
+// quantity, canonical English name, Dutch AH search term and — constrained
+// to the known alias keys so it can't paraphrase — the matching alias, in one call.
 async function normalizeItems(lines, aliasKeys) {
   const out = await callClaude(
     `You parse shopping-list lines written by different people in different formats, for ` +
       `the Albert Heijn (AH) Dutch supermarket app. For each line, in order, return:\n` +
       `- quantity: the number of units asked for (e.g. "4 x bratwurst", "portobellos x2"); 1 if none given.\n` +
-      `- name: a short lowercase English name for the item, without the quantity. If the line ` +
-      `means one of these known items, use the known name exactly: ${JSON.stringify(aliasKeys)}\n` +
+      `- name: a short lowercase English name for the item, without the quantity.\n` +
+      `- alias: if the line means one of the known items listed in the schema (allowing for ` +
+      `plurals, spelling, extra detail like "eg cheddar" or "big"), that known item; otherwise null.\n` +
       `- searchTerm: the single best Dutch search term (1-3 words) matching how AH names this ` +
       `product category, using real Dutch compound words (e.g. "peanut butter" -> "pindakaas").`,
     lines.map((l, i) => `${i}. ${l}`).join("\n"),
@@ -284,8 +287,9 @@ async function normalizeItems(lines, aliasKeys) {
                 quantity: { type: "integer" },
                 name: { type: "string" },
                 searchTerm: { type: "string" },
+                alias: { type: ["string", "null"], enum: [...aliasKeys, null] },
               },
-              required: ["quantity", "name", "searchTerm"],
+              required: ["quantity", "name", "searchTerm", "alias"],
             },
           },
         },
@@ -435,7 +439,7 @@ async function main() {
   const products = []; // { index, productId, quantity, title }
   const toSearch = []; // { index, line, name, quantity, searchTerm }
   normalized.forEach((n, index) => {
-    const alias = aliases[n.name];
+    const alias = aliases[n.alias] ?? aliases[n.name];
     if (alias) products.push({ index, productId: alias.productId, quantity: n.quantity, title: alias.title });
     else toSearch.push({ index, line: lines[index], name: n.name, quantity: n.quantity, searchTerm: n.searchTerm });
   });
